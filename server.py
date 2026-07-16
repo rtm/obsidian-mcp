@@ -15,7 +15,39 @@ import platform
 import shutil
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("obsidian")
+def _transport_security():
+    """Keep FastMCP's DNS-rebinding protection ON, but allow the hostnames we
+    actually serve (the public tunnel host + loopback). Env-driven so the
+    hostname isn't baked into source. Returns None when unset → FastMCP default
+    (loopback only), which is correct for plain local/stdio use."""
+    hosts = os.environ.get("OBSIDIAN_MCP_ALLOWED_HOSTS")
+    if not hosts:
+        return None
+    from mcp.server.transport_security import TransportSecuritySettings
+    origins = os.environ.get("OBSIDIAN_MCP_ALLOWED_ORIGINS", "")
+    return TransportSecuritySettings(
+        allowed_hosts=[h.strip() for h in hosts.split(",") if h.strip()],
+        allowed_origins=[o.strip() for o in origins.split(",") if o.strip()],
+    )
+
+
+mcp = FastMCP(
+    "obsidian",
+    # Server-level guidance sent to the client in the MCP `initialize` handshake.
+    # One line on purpose: the vault stays the single source of truth. The named
+    # note gathers the conventions and links to the rest.
+    instructions=(
+        'Before working with this Obsidian vault in any way—searching, reading, '
+        'creating, or editing—first read the note "Instructions to the Chef" '
+        '(read_note path="meta/Instructions to the Chef.md") and follow it.'
+    ),
+    # Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
+    # Default binds to loopback — the public path is a tunnel in front, never a
+    # direct listen on a routable interface.
+    host=os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("OBSIDIAN_MCP_PORT", "8788")),
+    transport_security=_transport_security(),
+)
 
 
 def _find_cli() -> str:
@@ -528,8 +560,144 @@ async def version() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool annotations — hint which tools only read vs. modify the vault, so clients
+# can auto-approve reads and prompt only on writes. Hints, not enforcement; the
+# client decides whether to honor them.
+# ---------------------------------------------------------------------------
+
+_READ_ONLY_TOOLS = {
+    "vault_info", "list_vaults", "read_note", "file_info", "outline", "search",
+    "read_property", "daily_read", "daily_path", "list_files", "list_folders",
+    "list_tags", "backlinks", "orphans", "unresolved_links", "list_tasks",
+    "list_templates", "read_template", "list_bookmarks", "list_properties",
+    "list_commands", "list_plugins", "sync_status", "version",
+}
+_DESTRUCTIVE_TOOLS = {"delete_file", "remove_property"}
+
+
+def _annotate_tools():
+    """Attach read-only / destructive hints to every registered tool. Uses the
+    tool-manager registry; guarded so a FastMCP internals change degrades to
+    'no hints' rather than breaking startup."""
+    from mcp.types import ToolAnnotations
+    try:
+        registry = mcp._tool_manager._tools
+    except AttributeError:
+        return
+    for name, tool in registry.items():
+        if name in _READ_ONLY_TOOLS:
+            tool.annotations = ToolAnnotations(readOnlyHint=True)
+        else:
+            tool.annotations = ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=name in _DESTRUCTIVE_TOOLS,
+            )
+
+
+_annotate_tools()
+
+
+# ---------------------------------------------------------------------------
+# Auth (HTTP transport only)
+# ---------------------------------------------------------------------------
+
+class _AccessVerifier:
+    """Verify a Cloudflare Access 'Cf-Access-Jwt-Assertion' JWT — signature
+    (RS256, keys from the team's JWKS), issuer, audience (the app's AUD tag),
+    and expiry. This is how requests arriving via Cloudflare Access (claude.ai
+    web / Cowork, which authenticate through Access Managed OAuth) are trusted."""
+
+    def __init__(self, team_domain: str, aud: str):
+        self.issuer = f"https://{team_domain}"
+        self.aud = aud
+        self._jwks = None  # lazily-built jwt.PyJWKClient (does network I/O)
+
+    def _client(self):
+        if self._jwks is None:
+            import jwt
+            self._jwks = jwt.PyJWKClient(f"{self.issuer}/cdn-cgi/access/certs")
+        return self._jwks
+
+    def verify(self, token: str) -> bool:
+        import jwt
+        try:
+            key = self._client().get_signing_key_from_jwt(token).key
+            jwt.decode(token, key, algorithms=["RS256"], audience=self.aud,
+                       issuer=self.issuer)
+            return True
+        except Exception:
+            return False
+
+
+class _AuthASGI:
+    """Pure-ASGI gate (not BaseHTTPMiddleware, so it never buffers the SSE
+    streaming responses the MCP transport relies on). A request is allowed if
+    EITHER a valid bearer token (local/LAN path) OR a valid Cloudflare Access
+    assertion (the claude.ai path) is present; otherwise 401."""
+
+    def __init__(self, app, token=None, access: "_AccessVerifier | None" = None):
+        self.app = app
+        self._expected = f"Bearer {token}".encode() if token else None
+        self.access = access
+
+    async def _ok(self, headers: dict) -> bool:
+        if self._expected is not None:
+            import hmac
+            if hmac.compare_digest(headers.get(b"authorization", b""),
+                                   self._expected):
+                return True
+        if self.access is not None:
+            tok = headers.get(b"cf-access-jwt-assertion", b"").decode()
+            if tok:
+                import asyncio
+                if await asyncio.to_thread(self.access.verify, tok):
+                    return True
+        return False
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            if not await self._ok(headers):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"error":"unauthorized"}',
+                })
+                return
+        await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    # Default stdio keeps the local Claude Code integration working unchanged.
+    # Set OBSIDIAN_MCP_TRANSPORT=streamable-http to run as a persistent networked
+    # service (behind a tunnel) for claude.ai web / Cowork.
+    transport = os.environ.get("OBSIDIAN_MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+    elif transport == "streamable-http":
+        token = os.environ.get("OBSIDIAN_MCP_TOKEN")
+        team = os.environ.get("OBSIDIAN_MCP_ACCESS_TEAM_DOMAIN")
+        aud = os.environ.get("OBSIDIAN_MCP_ACCESS_AUD")
+        access = _AccessVerifier(team, aud) if team and aud else None
+        if not token and access is None:
+            # No auth configured — bare HTTP, fine only for loopback-local testing.
+            mcp.run(transport="streamable-http")
+        else:
+            import uvicorn
+            app = _AuthASGI(mcp.streamable_http_app(), token=token, access=access)
+            uvicorn.run(
+                app,
+                host=os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1"),
+                port=int(os.environ.get("OBSIDIAN_MCP_PORT", "8788")),
+                log_level="warning",
+            )
+    else:
+        mcp.run(transport=transport)
