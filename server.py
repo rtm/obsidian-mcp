@@ -15,6 +15,8 @@ import platform
 import shutil
 from mcp.server.fastmcp import FastMCP
 
+import vault_index
+
 def _transport_security():
     """Keep FastMCP's DNS-rebinding protection ON, but allow the hostnames we
     actually serve (the public tunnel host + loopback). Env-driven so the
@@ -39,7 +41,10 @@ mcp = FastMCP(
     instructions=(
         'Before working with this Obsidian vault in any way—searching, reading, '
         'creating, or editing—first read the note "Instructions to the Chef" '
-        '(read_note path="meta/Instructions to the Chef.md") and follow it.'
+        '(read_note path="meta/Instructions to the Chef.md") and follow it. '
+        'To find notes, prefer `hybrid_search`: it fuses keyword and semantic '
+        'ranking and beats the plain `search` tool for anything but an exact '
+        'string match.'
     ),
     # Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
     # Default binds to loopback — the public path is a tunnel in front, never a
@@ -669,6 +674,156 @@ class _AuthASGI:
                 })
                 return
         await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Semantic / hybrid search
+#
+# Backed by a local sqlite-vec index built from Ollama embeddings, kept current
+# by the vault-search-reindex.timer user unit. These tools read that database
+# directly and never shell out to the Obsidian CLI, so they keep answering when
+# headless Obsidian is down—which is why this unit only Wants= obsidian.service
+# rather than Requires= it.
+# ---------------------------------------------------------------------------
+
+RRF_K = 60  # reciprocal-rank-fusion damping; 60 is the standard default
+
+
+def _search_key(hit: dict) -> tuple:
+    return (hit["vault"], hit["path"], hit["heading"])
+
+
+def _fmt_hits(hits: list[dict], limit_chars: int = 600) -> str:
+    if not hits:
+        return "No matches."
+    multi = len({h["vault"] for h in hits}) > 1
+    out = []
+    for i, h in enumerate(hits, 1):
+        text = h["text"]
+        if len(text) > limit_chars:
+            text = text[:limit_chars] + "…"
+        loc = f"{h['vault']}:{h['path']}" if multi else h["path"]
+        out.append(f"[{i}] {loc}  (score {h['score']})\n{h['heading']}\n{text}")
+    return "\n\n---\n\n".join(out)
+
+
+def _search_scope(vault: str | None, all_vaults: bool) -> str | None:
+    """None means 'every vault'; otherwise a validated vault name."""
+    return None if all_vaults else vault_index.resolve(vault)[0]
+
+
+@mcp.tool()
+async def hybrid_search(query: str, k: int = 8, vault: str | None = None,
+                        folder: str | None = None, all_vaults: bool = False) -> str:
+    """Search the vault by both keyword and meaning, fused into one ranking.
+
+    The recommended way to find notes. Combines BM25 keyword precision with
+    embedding recall, so it works whether or not you know the exact wording.
+
+    Args:
+        query: What you are looking for.
+        k: Number of results (default 8).
+        folder: Optional vault-relative folder, e.g. "writing/nihongoism".
+        vault: Vault name; omit for the default vault.
+        all_vaults: Search every vault instead of one.
+    """
+    scope = _search_scope(vault, all_vaults)
+    sem, kw = await asyncio.gather(
+        asyncio.to_thread(vault_index.semantic, query, k * 3, scope, folder),
+        asyncio.to_thread(vault_index.keyword, query, k * 3, scope, folder),
+    )
+    scores: dict[tuple, float] = {}
+    best: dict[tuple, dict] = {}
+    for ranking in (sem, kw):
+        for rank, hit in enumerate(ranking):
+            key = _search_key(hit)
+            scores[key] = scores.get(key, 0) + 1 / (RRF_K + rank)
+            best.setdefault(key, hit)
+
+    fused, seen_notes = [], set()
+    for key in sorted(scores, key=lambda k_: scores[k_], reverse=True):
+        note = (key[0], key[1])
+        # One chunk per note: several chunks of one long note crowding out
+        # everything else is the classic failure mode of chunked retrieval.
+        if note in seen_notes:
+            continue
+        seen_notes.add(note)
+        fused.append({**best[key], "score": round(scores[key], 5)})
+        if len(fused) == k:
+            break
+    return _fmt_hits(fused)
+
+
+@mcp.tool()
+async def semantic_search(query: str, k: int = 8, vault: str | None = None,
+                          folder: str | None = None, all_vaults: bool = False) -> str:
+    """Find notes by meaning rather than exact wording.
+
+    Use when you know the concept but not the vocabulary the note uses. For
+    exact strings—sigil filenames, dates, identifiers—prefer `search`.
+
+    Args:
+        query: What you are looking for, in natural language.
+        k: Number of results (default 8).
+        folder: Optional vault-relative folder to restrict to.
+        vault: Vault name; omit for the default vault.
+        all_vaults: Search every vault instead of one.
+    """
+    scope = _search_scope(vault, all_vaults)
+    hits = await asyncio.to_thread(vault_index.semantic, query, k, scope, folder)
+    return _fmt_hits(hits)
+
+
+@mcp.tool()
+async def reindex_vault(vault: str | None = None, all_vaults: bool = False) -> str:
+    """Bring the search index up to date now rather than waiting for the timer.
+
+    Only changed notes are re-embedded, so this is fast when little has changed.
+    Call it when a note was just written and a search for it comes up empty.
+
+    Args:
+        vault: Vault to refresh; omit for the default vault.
+        all_vaults: Refresh every vault instead of one.
+    """
+    scope = None if all_vaults else vault_index.resolve(vault)[0]
+    try:
+        stats = await asyncio.to_thread(vault_index.reindex, scope)
+    except RuntimeError as e:
+        return str(e)
+    return (
+        f"Reindexed {', '.join(stats['vaults'])}: {stats['files_changed']} changed, "
+        f"{stats['files_removed']} removed, {stats['chunks_written']} chunks written, "
+        f"{stats['chunks_total']} chunks total."
+    )
+
+
+@mcp.tool()
+async def index_status() -> str:
+    """Report search-index freshness: notes and chunks indexed per vault."""
+    def _stat():
+        known = vault_index.vaults()
+        db = vault_index.connect()
+        try:
+            files = dict(db.execute(
+                "SELECT vault, COUNT(*) FROM files GROUP BY vault").fetchall())
+            chunks = dict(db.execute(
+                "SELECT vault, COUNT(*) FROM chunks GROUP BY vault").fetchall())
+        finally:
+            db.close()
+        disk = {n: sum(1 for _ in vault_index.iter_notes(p)) for n, p in known.items()}
+        return files, chunks, disk
+
+    files, chunks, disk = await asyncio.to_thread(_stat)
+    db_mb = (round(vault_index.DB_PATH.stat().st_size / 1e6, 1)
+             if vault_index.DB_PATH.exists() else 0)
+    lines = [
+        f"  {name}: {files.get(name, 0)} indexed / {n} on disk, "
+        f"{chunks.get(name, 0)} chunks"
+        for name, n in sorted(disk.items())
+    ]
+    return ("Vaults:\n" + "\n".join(lines) +
+            f"\n\nIndex size: {db_mb} MB\nModel: {vault_index.MODEL}\n"
+            f"Database: {vault_index.DB_PATH}")
 
 
 # ---------------------------------------------------------------------------

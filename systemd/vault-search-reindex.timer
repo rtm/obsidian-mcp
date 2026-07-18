@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic reindex of Obsidian vaults for semantic search
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+# Catch up after downtime instead of silently skipping a tick.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
