@@ -63,9 +63,17 @@ def _find_cli() -> str:
     system = platform.system()
 
     if system == "Windows":
-        candidate = r"C:\Program Files\Obsidian\Obsidian.com"
-        if os.path.isfile(candidate):
-            return candidate
+        # Obsidian.com is the console build of the app (the CLI messenger that
+        # talks to the running GUI); Obsidian.exe is the GUI itself. Windows
+        # installs per-user by default, so check %LOCALAPPDATA% before the
+        # system-wide Program Files location.
+        local = os.environ.get("LOCALAPPDATA", "")
+        for candidate in (
+            os.path.join(local, "Obsidian", "Obsidian.com") if local else "",
+            r"C:\Program Files\Obsidian\Obsidian.com",
+        ):
+            if candidate and os.path.isfile(candidate):
+                return candidate
 
     elif system == "Darwin":
         # macOS: CLI ships inside the .app bundle
