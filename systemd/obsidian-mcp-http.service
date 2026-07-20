@@ -1,0 +1,31 @@
+[Unit]
+Description=Obsidian MCP server (streamable-HTTP) for claude.ai web / Cowork
+# The CLI-backed tools need headless Obsidian on :99, but the search tools read
+# the sqlite-vec index directly. Wants= rather than Requires= so vault search
+# keeps answering when Obsidian is down, instead of taking the doorway with it.
+Wants=obsidian.service
+After=obsidian.service
+
+[Service]
+WorkingDirectory=%h/wrk/projects/obsidian-mcp
+Environment=DISPLAY=:99
+# systemd gives a minimal PATH, so name the CLI explicitly (server honors OBSIDIAN_CLI).
+Environment=OBSIDIAN_CLI=%h/.local/bin/obsidian
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OBSIDIAN_MCP_TRANSPORT=streamable-http
+Environment=OBSIDIAN_MCP_HOST=127.0.0.1
+Environment=OBSIDIAN_MCP_PORT=8788
+# Keep DNS-rebinding protection on, but permit the public tunnel host + loopback.
+Environment=OBSIDIAN_MCP_ALLOWED_HOSTS=obsidian-mcp.pacifitech.com,127.0.0.1:8788,localhost:8788
+Environment=OBSIDIAN_MCP_ALLOWED_ORIGINS=https://obsidian-mcp.pacifitech.com
+# Trust Cloudflare Access assertions (claude.ai / Cowork path) for this app.
+Environment=OBSIDIAN_MCP_ACCESS_TEAM_DOMAIN=dry-field-1e8c.cloudflareaccess.com
+Environment=OBSIDIAN_MCP_ACCESS_AUD=2bb0880be1f2433c7f116aff071ff0c57aa3cde8c3228a93a0968270e7e262dc
+# Bearer token lives in a 600-perm file, not in the unit itself.
+EnvironmentFile=%h/.config/obsidian-mcp/env
+ExecStart=%h/wrk/projects/obsidian-mcp/.venv/bin/python %h/wrk/projects/obsidian-mcp/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
