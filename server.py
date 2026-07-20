@@ -102,8 +102,20 @@ VAULT = os.environ.get("OBSIDIAN_VAULT")
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Commands that change the vault. Anything here is gated on the vault actually
+# being open (see _assert_vault_open) so a wedged instance cannot silently accept
+# writes that will never propagate.
+_MUTATING = {
+    "create", "append", "prepend", "delete", "move", "rename",
+    "property:set", "property:remove", "task:toggle", "daily:append",
+    "daily:prepend", "base:create",
+}
+
+
 async def _run(*args: str) -> str:
     """Run the Obsidian CLI with the given arguments and return stdout."""
+    if args and args[0] in _MUTATING:
+        await _assert_vault_open()
     cmd = [OBSIDIAN]
     if VAULT:
         cmd.append(f"vault={VAULT}")
@@ -118,7 +130,43 @@ async def _run(*args: str) -> str:
     if proc.returncode != 0:
         err = stderr.decode().strip() or text.strip()
         raise RuntimeError(f"obsidian CLI error (exit {proc.returncode}): {err}")
+    # The CLI exits 0 even on failure and prints the error to stdout, so the exit
+    # code above catches nothing. Without this, `append file="nonexistent"` returns
+    # 'Error: File "nonexistent" not found.' as a *successful* tool result and the
+    # caller reports the write as done.
+    if text.lstrip().startswith("Error:"):
+        raise RuntimeError(f"obsidian CLI: {text.strip()}")
     return text
+
+
+# A vault stuck on the plugin-trust dialog still answers CLI calls and still
+# accepts writes—it just never opened properly, so Sync never starts and nothing
+# propagates outward. `obsidian sync status` reports "Sync is running" throughout.
+# Community plugins not loading is the one reliable local signal that this has
+# happened. See the vault note "Headless Obsidian Stalls on Dialog After Restart".
+_HEALTH_SENTINEL = os.environ.get("OBSIDIAN_MCP_HEALTH_PLUGIN", "dataview")
+_health_ok: bool | None = None  # cached; a wedged vault stays wedged until restarted
+
+
+async def _assert_vault_open() -> None:
+    """Raise if the vault appears stuck in restricted mode."""
+    global _health_ok
+    if _health_ok:
+        return
+    try:
+        plugins = await _run("plugins")
+    except RuntimeError:
+        return  # don't let a probe failure block real work
+    if _HEALTH_SENTINEL not in plugins:
+        raise RuntimeError(
+            f"Vault appears stuck in restricted mode: community plugin "
+            f"'{_HEALTH_SENTINEL}' is not loaded, so the vault never finished "
+            f"opening and Obsidian Sync is probably not running. Writes would "
+            f"land locally and never propagate. Refusing. Fix: open Obsidian's "
+            f"GUI (VNC) and dismiss the trust dialog. See the vault note "
+            f'"Headless Obsidian Stalls on Dialog After Restart".'
+        )
+    _health_ok = True
 
 
 def _file_args(file: str | None, path: str | None) -> list[str]:
