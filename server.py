@@ -142,6 +142,16 @@ async def _run(*args: str) -> str:
     # caller reports the write as done.
     if text.lstrip().startswith("Error:"):
         raise RuntimeError(f"obsidian CLI: {text.strip()}")
+    # Third failure mode, and the quietest: exit 0, nothing on stdout, nothing
+    # written. Neither guard above fires, so `create` returns "" and the caller
+    # reports the note as created. A mutating command that succeeded always says
+    # so; silence means the write did not land.
+    if args and args[0] in _MUTATING and not text.strip():
+        raise RuntimeError(
+            f"obsidian CLI: '{args[0]}' exited 0 but produced no output, so the "
+            f"write was not confirmed and probably did not happen. Verify the "
+            f"vault state before retrying."
+        )
     return text
 
 
