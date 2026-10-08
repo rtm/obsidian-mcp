@@ -27,12 +27,15 @@ class _FakeProc:
 class VaultArgumentTest(unittest.TestCase):
     def setUp(self):
         self.calls: list[tuple[str, ...]] = []
+        self.enabled_plugins: dict[str, bytes] = {}
         server._healthy_vaults.clear()
 
         async def fake_exec(*cmd, **_):
             self.calls.append(cmd)
-            # "plugins" is the health probe; everything else just succeeds.
-            return _FakeProc(b"dataview\n" if "plugins" in cmd else b"ok\n")
+            # "plugins:enabled" is the health probe; everything else succeeds.
+            if "plugins:enabled" in cmd:
+                return _FakeProc(self.enabled_plugins.get(cmd[1], b"breadcrumbs\n"))
+            return _FakeProc(b"ok\n")
 
         patcher = mock.patch.object(server.asyncio, "create_subprocess_exec", fake_exec)
         patcher.start()
@@ -64,8 +67,14 @@ class VaultArgumentTest(unittest.TestCase):
     def test_health_check_is_per_vault(self):
         self.call("append_to_note", path="a.md", content="x")
         self.call("append_to_note", path="a.md", content="x", vault="Notebooks")
-        probes = [c[1] for c in self.calls if "plugins" in c]
+        probes = [c[1] for c in self.calls if "plugins:enabled" in c]
         self.assertEqual(probes, ["vault=Vault", "vault=Notebooks"])
+
+    def test_write_refused_when_vault_has_no_enabled_community_plugins(self):
+        self.enabled_plugins["vault=Notebooks"] = b""
+        with self.assertRaisesRegex(Exception, "restricted mode"):
+            self.call("append_to_note", path="a.md", content="x", vault="Notebooks")
+        self.call("append_to_note", path="a.md", content="x")  # default vault still fine
 
 
 if __name__ == "__main__":

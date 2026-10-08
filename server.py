@@ -210,8 +210,10 @@ async def _run(*args: str) -> str:
 # accepts writes—it just never opened properly, so Sync never starts and nothing
 # propagates outward. `obsidian sync status` reports "Sync is running" throughout.
 # Community plugins not loading is the one reliable local signal that this has
-# happened. See the vault note "Headless Obsidian Stalls on Dialog After Restart".
-_HEALTH_SENTINEL = os.environ.get("OBSIDIAN_MCP_HEALTH_PLUGIN", "dataview")
+# happened: until the trust dialog is dismissed, none are enabled. Asking for
+# any enabled community plugin, rather than one named plugin, works for every
+# vault. See the vault note "Headless Obsidian Stalls on Dialog After Restart".
+
 # Vaults that passed the check. Cached per vault: a wedged vault stays wedged
 # until restarted, and one vault being healthy says nothing about another.
 _healthy_vaults: set[str | None] = set()
@@ -223,13 +225,13 @@ async def _assert_vault_open() -> None:
     if vault in _healthy_vaults:
         return
     try:
-        plugins = await _run("plugins")
+        plugins = await _run("plugins:enabled", "filter=community")
     except RuntimeError:
         return  # don't let a probe failure block real work
-    if _HEALTH_SENTINEL not in plugins:
+    if not plugins.strip():
         raise RuntimeError(
-            f"Vault appears stuck in restricted mode: community plugin "
-            f"'{_HEALTH_SENTINEL}' is not loaded, so the vault never finished "
+            f"Vault {vault or '(active)'} appears stuck in restricted mode: no "
+            f"community plugins are enabled, so the vault never finished "
             f"opening and Obsidian Sync is probably not running. Writes would "
             f"land locally and never propagate. Refusing. Fix: open Obsidian's "
             f"GUI (VNC) and dismiss the trust dialog. See the vault note "
