@@ -61,12 +61,22 @@ Add to `~/.claude.json` under `mcpServers`:
 
 Restart Claude Code to pick up the change.
 
+## Tests
+
+```
+python -m unittest discover tests
+```
+
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `OBSIDIAN_VAULT` | No | Vault name for multi-vault setups. If omitted, uses the active vault. |
+| `OBSIDIAN_VAULT` | No | Default vault. If omitted, tools target whichever vault Obsidian has active. |
 | `OBSIDIAN_CLI` | No | Path to the CLI binary. Auto-detected if omitted. |
+
+### Choosing a vault per call
+
+Every tool except `list_vaults` and `version` takes an optional `vault` argument. A call with `vault="Notebooks"` runs against that vault; a call without it uses `OBSIDIAN_VAULT`. One server can therefore reach every vault Obsidian knows about, and setting `OBSIDIAN_VAULT` keeps the default from drifting when someone switches vaults in the Obsidian UI.
 
 ### Auto-detection paths
 
