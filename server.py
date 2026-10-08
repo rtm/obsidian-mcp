@@ -6,14 +6,20 @@ Exposes a curated set of tools — no eval, no dev commands, no shell injection 
 
 Configure via environment variables:
   OBSIDIAN_CLI  — path to the CLI binary (auto-detected if omitted)
-  OBSIDIAN_VAULT — vault name for multi-vault setups (optional)
+  OBSIDIAN_VAULT — default vault name for multi-vault setups (optional); every
+                   vault tool also takes a `vault` argument that overrides it
 """
 
 import asyncio
+import contextvars
+import functools
+import inspect
 import os
 import platform
 import shutil
+from typing import Annotated
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 def _transport_security():
     """Keep FastMCP's DNS-rebinding protection ON, but allow the hostnames we
@@ -42,7 +48,9 @@ mcp = FastMCP(
         '(read_note path="meta/Instructions to the Chef.md") and follow it. '
         'This server does vault reads and writes only. Semantic search lives in '
         'a separate `vault-search` server; if it is configured, prefer its '
-        '`hybrid_search` over the exact-match `search` tool here.'
+        '`hybrid_search` over the exact-match `search` tool here. '
+        'Tools take an optional `vault` argument to reach another vault '
+        '(names from `list_vaults`); omit it for the default vault.'
     ),
     # Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
     # Default binds to loopback — the public path is a tunnel in front, never a
@@ -104,6 +112,48 @@ def _find_cli() -> str:
 OBSIDIAN = _find_cli()
 VAULT = os.environ.get("OBSIDIAN_VAULT")
 
+# The vault the current tool call targets. Set per call by `vault_tool`; read by
+# `_run`. A context variable rather than an argument threaded through every
+# helper, so concurrent calls to different vaults cannot see each other's choice.
+_vault: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "vault", default=VAULT
+)
+
+_VAULT_PARAM = inspect.Parameter(
+    "vault",
+    inspect.Parameter.KEYWORD_ONLY,
+    default=None,
+    annotation=Annotated[
+        str | None,
+        Field(
+            description="Vault name, e.g. 'Notebooks'. Omit to use the default "
+            "vault this server is configured for."
+        ),
+    ],
+)
+
+
+def vault_tool(fn):
+    """Register `fn` as an MCP tool that also accepts an optional `vault` argument.
+
+    Without the argument a session is stuck with whichever vault the server was
+    started for (or Obsidian's current vault), with no way to reach another."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, vault: str | None = None, **kwargs):
+        token = _vault.set(vault or VAULT)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _vault.reset(token)
+
+    sig = inspect.signature(fn)
+    wrapper.__signature__ = sig.replace(
+        parameters=[*sig.parameters.values(), _VAULT_PARAM]
+    )
+    return mcp.tool()(wrapper)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -123,8 +173,9 @@ async def _run(*args: str) -> str:
     if args and args[0] in _MUTATING:
         await _assert_vault_open()
     cmd = [OBSIDIAN]
-    if VAULT:
-        cmd.append(f"vault={VAULT}")
+    vault = _vault.get()
+    if vault:
+        cmd.append(f"vault={vault}")
     cmd.extend(args)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -161,13 +212,15 @@ async def _run(*args: str) -> str:
 # Community plugins not loading is the one reliable local signal that this has
 # happened. See the vault note "Headless Obsidian Stalls on Dialog After Restart".
 _HEALTH_SENTINEL = os.environ.get("OBSIDIAN_MCP_HEALTH_PLUGIN", "dataview")
-_health_ok: bool | None = None  # cached; a wedged vault stays wedged until restarted
+# Vaults that passed the check. Cached per vault: a wedged vault stays wedged
+# until restarted, and one vault being healthy says nothing about another.
+_healthy_vaults: set[str | None] = set()
 
 
 async def _assert_vault_open() -> None:
     """Raise if the vault appears stuck in restricted mode."""
-    global _health_ok
-    if _health_ok:
+    vault = _vault.get()
+    if vault in _healthy_vaults:
         return
     try:
         plugins = await _run("plugins")
@@ -182,7 +235,7 @@ async def _assert_vault_open() -> None:
             f"GUI (VNC) and dismiss the trust dialog. See the vault note "
             f'"Headless Obsidian Stalls on Dialog After Restart".'
         )
-    _health_ok = True
+    _healthy_vaults.add(vault)
 
 
 def _file_args(file: str | None, path: str | None) -> list[str]:
@@ -207,7 +260,7 @@ def _optional(name: str, value) -> list[str]:
 # Vault info
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def vault_info() -> str:
     """Show current vault name, path, file/folder counts, and size."""
     return await _run("vault")
@@ -223,7 +276,7 @@ async def list_vaults() -> str:
 # Reading
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def read_note(file: str | None = None, path: str | None = None) -> str:
     """Read the contents of a note. Specify file (wikilink name) or path (exact)."""
     fa = _file_args(file, path)
@@ -232,7 +285,7 @@ async def read_note(file: str | None = None, path: str | None = None) -> str:
     return await _run("read", *fa)
 
 
-@mcp.tool()
+@vault_tool
 async def file_info(file: str | None = None, path: str | None = None) -> str:
     """Show metadata for a file (size, dates, links, tags)."""
     fa = _file_args(file, path)
@@ -241,7 +294,7 @@ async def file_info(file: str | None = None, path: str | None = None) -> str:
     return await _run("file", *fa)
 
 
-@mcp.tool()
+@vault_tool
 async def outline(
     file: str | None = None,
     path: str | None = None,
@@ -256,7 +309,7 @@ async def outline(
 # Search
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def search(
     query: str,
     path: str | None = None,
@@ -276,7 +329,7 @@ async def search(
 # Writing / modifying
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def create_note(
     name: str | None = None,
     path: str | None = None,
@@ -295,7 +348,7 @@ async def create_note(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def append_to_note(
     content: str,
     file: str | None = None,
@@ -312,7 +365,7 @@ async def append_to_note(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def prepend_to_note(
     content: str,
     file: str | None = None,
@@ -329,7 +382,7 @@ async def prepend_to_note(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def set_property(
     name: str,
     value: str,
@@ -344,7 +397,7 @@ async def set_property(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def read_property(
     name: str,
     file: str | None = None,
@@ -355,7 +408,7 @@ async def read_property(
     return await _run("property:read", f"name={name}", *fa)
 
 
-@mcp.tool()
+@vault_tool
 async def remove_property(
     name: str,
     file: str | None = None,
@@ -370,13 +423,13 @@ async def remove_property(
 # Daily notes
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def daily_read() -> str:
     """Read today's daily note."""
     return await _run("daily:read")
 
 
-@mcp.tool()
+@vault_tool
 async def daily_append(content: str, inline: bool = False) -> str:
     """Append content to today's daily note."""
     args = ["daily:append", f"content={content}"]
@@ -385,7 +438,7 @@ async def daily_append(content: str, inline: bool = False) -> str:
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def daily_prepend(content: str, inline: bool = False) -> str:
     """Prepend content to today's daily note."""
     args = ["daily:prepend", f"content={content}"]
@@ -394,7 +447,7 @@ async def daily_prepend(content: str, inline: bool = False) -> str:
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def daily_path() -> str:
     """Get the file path of today's daily note."""
     return await _run("daily:path")
@@ -404,7 +457,7 @@ async def daily_path() -> str:
 # File management
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_files(
     folder: str | None = None,
     ext: str | None = None,
@@ -416,7 +469,7 @@ async def list_files(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def list_folders(folder: str | None = None) -> str:
     """List folders in the vault."""
     args = ["folders"]
@@ -424,7 +477,7 @@ async def list_folders(folder: str | None = None) -> str:
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def move_file(
     to: str,
     file: str | None = None,
@@ -437,7 +490,7 @@ async def move_file(
     return await _run("move", *fa, f"to={to}")
 
 
-@mcp.tool()
+@vault_tool
 async def rename_file(
     name: str,
     file: str | None = None,
@@ -450,7 +503,7 @@ async def rename_file(
     return await _run("rename", *fa, f"name={name}")
 
 
-@mcp.tool()
+@vault_tool
 async def delete_file(
     file: str | None = None,
     path: str | None = None,
@@ -470,7 +523,7 @@ async def delete_file(
 # Tags & links
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_tags(
     file: str | None = None,
     path: str | None = None,
@@ -486,7 +539,7 @@ async def list_tags(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def backlinks(
     file: str | None = None,
     path: str | None = None,
@@ -498,13 +551,13 @@ async def backlinks(
     return await _run("backlinks", *fa, "counts", "format=json")
 
 
-@mcp.tool()
+@vault_tool
 async def orphans() -> str:
     """List notes with no incoming links."""
     return await _run("orphans")
 
 
-@mcp.tool()
+@vault_tool
 async def unresolved_links() -> str:
     """List wikilinks that don't resolve to any file."""
     return await _run("unresolved", "verbose", "format=json")
@@ -514,7 +567,7 @@ async def unresolved_links() -> str:
 # Tasks
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_tasks(
     file: str | None = None,
     path: str | None = None,
@@ -533,7 +586,7 @@ async def list_tasks(
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def toggle_task(
     file: str | None = None,
     path: str | None = None,
@@ -550,13 +603,13 @@ async def toggle_task(
 # Templates & bookmarks
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_templates() -> str:
     """List available templates."""
     return await _run("templates")
 
 
-@mcp.tool()
+@vault_tool
 async def read_template(name: str, resolve: bool = False, title: str | None = None) -> str:
     """Read a template's content, optionally resolving variables."""
     args = ["template:read", f"name={name}"]
@@ -566,7 +619,7 @@ async def read_template(name: str, resolve: bool = False, title: str | None = No
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def list_bookmarks() -> str:
     """List bookmarks."""
     return await _run("bookmarks", "verbose", "format=json")
@@ -576,7 +629,7 @@ async def list_bookmarks() -> str:
 # Properties (vault-wide)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_properties(
     file: str | None = None,
     path: str | None = None,
@@ -594,7 +647,7 @@ async def list_properties(
 # Misc
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@vault_tool
 async def list_commands(filter: str | None = None) -> str:
     """List available Obsidian commands (for use with run_command)."""
     args = ["commands"]
@@ -602,13 +655,13 @@ async def list_commands(filter: str | None = None) -> str:
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def run_command(id: str) -> str:
     """Execute an Obsidian command by its ID (e.g. 'editor:toggle-bold')."""
     return await _run("command", f"id={id}")
 
 
-@mcp.tool()
+@vault_tool
 async def list_plugins(filter: str | None = None) -> str:
     """List installed plugins."""
     args = ["plugins", "versions", "format=json"]
@@ -616,7 +669,7 @@ async def list_plugins(filter: str | None = None) -> str:
     return await _run(*args)
 
 
-@mcp.tool()
+@vault_tool
 async def sync_status() -> str:
     """Show Obsidian Sync status."""
     return await _run("sync:status")
