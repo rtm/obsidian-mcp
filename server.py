@@ -58,12 +58,6 @@ mcp = MCPServer(
     ),
 )
 
-# Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
-# Default binds to loopback — the public path is a tunnel in front, never a
-# direct listen on a routable interface.
-HTTP_HOST = os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1")
-HTTP_PORT = int(os.environ.get("OBSIDIAN_MCP_PORT", "8788"))
-
 
 def _find_cli() -> str:
     """Locate the Obsidian CLI binary."""
@@ -181,11 +175,14 @@ async def _run(*args: str) -> str:
     if vault:
         cmd.append(f"vault={vault}")
     cmd.extend(args)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        raise ToolError(f"cannot run the Obsidian CLI at {OBSIDIAN!r}: {e}") from e
     stdout, stderr = await proc.communicate()
     text = stdout.decode()
     if proc.returncode != 0:
@@ -810,27 +807,25 @@ if __name__ == "__main__":
     transport = os.environ.get("OBSIDIAN_MCP_TRANSPORT", "stdio")
     if transport == "stdio":
         mcp.run()
-    elif transport == "streamable-http":
+    else:
+        # Default binds to loopback — the public path is a tunnel in front,
+        # never a direct listen on a routable interface.
+        host = os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("OBSIDIAN_MCP_PORT", "8788"))
+        security = _transport_security()
         token = os.environ.get("OBSIDIAN_MCP_TOKEN")
         team = os.environ.get("OBSIDIAN_MCP_ACCESS_TEAM_DOMAIN")
         aud = os.environ.get("OBSIDIAN_MCP_ACCESS_AUD")
         access = _AccessVerifier(team, aud) if team and aud else None
-        security = _transport_security()
-        if not token and access is None:
-            # No auth configured — bare HTTP, fine only for loopback-local testing.
-            mcp.run(
-                transport="streamable-http",
-                host=HTTP_HOST,
-                port=HTTP_PORT,
-                transport_security=security,
-            )
-        else:
+        if transport == "streamable-http" and (token or access):
             import uvicorn
             app = _AuthASGI(
-                mcp.streamable_http_app(host=HTTP_HOST, transport_security=security),
+                mcp.streamable_http_app(host=host, transport_security=security),
                 token=token,
                 access=access,
             )
-            uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")
-    else:
-        mcp.run(transport=transport)
+            uvicorn.run(app, host=host, port=port, log_level="warning")
+        else:
+            # No auth configured — bare HTTP, fine only for loopback-local testing.
+            mcp.run(transport=transport, host=host, port=port,
+                    transport_security=security)

@@ -93,6 +93,53 @@ class VaultArgumentTest(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertIn("restricted mode", result.content[0].text)
 
+    def test_spawn_failure_text_reaches_the_client(self):
+        async def fail_exec(*cmd, **_):
+            raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+        with mock.patch.object(server.asyncio, "create_subprocess_exec", fail_exec):
+            with self.assertRaisesRegex(Exception, "cannot run the Obsidian CLI"):
+                self.call("read_note", path="a.md")
+
+
+class HttpTransportTest(unittest.TestCase):
+    """The HTTP path only runs on the networked host, so a bad keyword to the
+    SDK's app factory would otherwise surface as a crash-looping service."""
+
+    def test_app_factory_accepts_our_keywords(self):
+        os.environ["OBSIDIAN_MCP_ALLOWED_HOSTS"] = "example.com,127.0.0.1:8788"
+        self.addCleanup(os.environ.pop, "OBSIDIAN_MCP_ALLOWED_HOSTS")
+        server.mcp.streamable_http_app(
+            host="127.0.0.1", transport_security=server._transport_security()
+        )
+
+    def _gate(self, token):
+        async def accepted(scope, receive, send):
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        return server._AuthASGI(accepted, token=token)
+
+    def _status(self, app, headers):
+        import httpx
+
+        async def go():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                return (await client.post("/mcp", json={}, headers=headers)).status_code
+
+        return asyncio.run(go())
+
+    def test_gate_rejects_missing_or_wrong_token(self):
+        app = self._gate(token="secret")
+        self.assertEqual(self._status(app, {}), 401)
+        self.assertEqual(self._status(app, {"Authorization": "Bearer nope"}), 401)
+
+    def test_gate_admits_the_token(self):
+        app = self._gate(token="secret")
+        self.assertEqual(self._status(app, {"Authorization": "Bearer secret"}), 204)
+
 
 if __name__ == "__main__":
     unittest.main()
