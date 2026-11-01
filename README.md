@@ -36,7 +36,7 @@ Requires Obsidian 1.8+ with the CLI enabled and running for the CLI-backed tools
 git clone <this-repo> obsidian-mcp
 cd obsidian-mcp
 python3 -m venv .venv
-.venv/bin/pip install "mcp[cli]>=1.0.0"
+.venv/bin/pip install "mcp[cli]>=2,<3"
 ```
 
 On Windows, replace `.venv/bin/pip` with `.venv\Scripts\pip`.
