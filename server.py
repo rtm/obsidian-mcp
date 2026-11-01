@@ -18,13 +18,17 @@ import os
 import platform
 import shutil
 from typing import Annotated
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+# Anticipated failures must be raised as ToolError: the SDK forwards its text to
+# the model as an is_error result, while any other exception reaches the model
+# as a bare "Error executing tool <name>" with the cause kept server-side.
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 def _transport_security():
-    """Keep FastMCP's DNS-rebinding protection ON, but allow the hostnames we
+    """Keep the SDK's DNS-rebinding protection ON, but allow the hostnames we
     actually serve (the public tunnel host + loopback). Env-driven so the
-    hostname isn't baked into source. Returns None when unset → FastMCP default
+    hostname isn't baked into source. Returns None when unset → SDK default
     (loopback only), which is correct for plain local/stdio use."""
     hosts = os.environ.get("OBSIDIAN_MCP_ALLOWED_HOSTS")
     if not hosts:
@@ -37,7 +41,7 @@ def _transport_security():
     )
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "obsidian",
     # Server-level guidance sent to the client in the MCP `initialize` handshake.
     # One line on purpose: the vault stays the single source of truth. The named
@@ -52,13 +56,13 @@ mcp = FastMCP(
         'Tools take an optional `vault` argument to reach another vault '
         '(names from `list_vaults`); omit it for the default vault.'
     ),
-    # Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
-    # Default binds to loopback — the public path is a tunnel in front, never a
-    # direct listen on a routable interface.
-    host=os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1"),
-    port=int(os.environ.get("OBSIDIAN_MCP_PORT", "8788")),
-    transport_security=_transport_security(),
 )
+
+# Only used when served over HTTP (OBSIDIAN_MCP_TRANSPORT=streamable-http).
+# Default binds to loopback — the public path is a tunnel in front, never a
+# direct listen on a routable interface.
+HTTP_HOST = os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("OBSIDIAN_MCP_PORT", "8788"))
 
 
 def _find_cli() -> str:
@@ -186,19 +190,19 @@ async def _run(*args: str) -> str:
     text = stdout.decode()
     if proc.returncode != 0:
         err = stderr.decode().strip() or text.strip()
-        raise RuntimeError(f"obsidian CLI error (exit {proc.returncode}): {err}")
+        raise ToolError(f"obsidian CLI error (exit {proc.returncode}): {err}")
     # The CLI exits 0 even on failure and prints the error to stdout, so the exit
     # code above catches nothing. Without this, `append file="nonexistent"` returns
     # 'Error: File "nonexistent" not found.' as a *successful* tool result and the
     # caller reports the write as done.
     if text.lstrip().startswith("Error:"):
-        raise RuntimeError(f"obsidian CLI: {text.strip()}")
+        raise ToolError(f"obsidian CLI: {text.strip()}")
     # Third failure mode, and the quietest: exit 0, nothing on stdout, nothing
     # written. Neither guard above fires, so `create` returns "" and the caller
     # reports the note as created. A mutating command that succeeded always says
     # so; silence means the write did not land.
     if args and args[0] in _MUTATING and not text.strip():
-        raise RuntimeError(
+        raise ToolError(
             f"obsidian CLI: '{args[0]}' exited 0 but produced no output, so the "
             f"write was not confirmed and probably did not happen. Verify the "
             f"vault state before retrying."
@@ -226,10 +230,10 @@ async def _assert_vault_open() -> None:
         return
     try:
         plugins = await _run("plugins:enabled", "filter=community")
-    except RuntimeError:
+    except ToolError:
         return  # don't let a probe failure block real work
     if not plugins.strip():
-        raise RuntimeError(
+        raise ToolError(
             f"Vault {vault or '(active)'} appears stuck in restricted mode: no "
             f"community plugins are enabled, so the vault never finished "
             f"opening and Obsidian Sync is probably not running. Writes would "
@@ -283,7 +287,7 @@ async def read_note(file: str | None = None, path: str | None = None) -> str:
     """Read the contents of a note. Specify file (wikilink name) or path (exact)."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     return await _run("read", *fa)
 
 
@@ -292,7 +296,7 @@ async def file_info(file: str | None = None, path: str | None = None) -> str:
     """Show metadata for a file (size, dates, links, tags)."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     return await _run("file", *fa)
 
 
@@ -360,7 +364,7 @@ async def append_to_note(
     """Append content to an existing note."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     args = ["append", *fa, f"content={content}"]
     if inline:
         args.append("inline")
@@ -377,7 +381,7 @@ async def prepend_to_note(
     """Prepend content to an existing note."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     args = ["prepend", *fa, f"content={content}"]
     if inline:
         args.append("inline")
@@ -488,7 +492,7 @@ async def move_file(
     """Move or rename a file. 'to' is the destination folder or full path."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     return await _run("move", *fa, f"to={to}")
 
 
@@ -501,7 +505,7 @@ async def rename_file(
     """Rename a file (updates all links)."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     return await _run("rename", *fa, f"name={name}")
 
 
@@ -514,7 +518,7 @@ async def delete_file(
     """Delete a file (moves to trash by default)."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     args = ["delete", *fa]
     if permanent:
         args.append("permanent")
@@ -549,7 +553,7 @@ async def backlinks(
     """List files that link to a given note."""
     fa = _file_args(file, path)
     if not fa:
-        raise ValueError("Provide file= or path=")
+        raise ToolError("Provide file= or path=")
     return await _run("backlinks", *fa, "counts", "format=json")
 
 
@@ -701,7 +705,7 @@ _DESTRUCTIVE_TOOLS = {"delete_file", "remove_property"}
 
 def _annotate_tools():
     """Attach read-only / destructive hints to every registered tool. Uses the
-    tool-manager registry; guarded so a FastMCP internals change degrades to
+    tool-manager registry; guarded so an SDK internals change degrades to
     'no hints' rather than breaking startup."""
     from mcp.types import ToolAnnotations
     try:
@@ -710,11 +714,11 @@ def _annotate_tools():
         return
     for name, tool in registry.items():
         if name in _READ_ONLY_TOOLS:
-            tool.annotations = ToolAnnotations(readOnlyHint=True)
+            tool.annotations = ToolAnnotations(read_only_hint=True)
         else:
             tool.annotations = ToolAnnotations(
-                readOnlyHint=False,
-                destructiveHint=name in _DESTRUCTIVE_TOOLS,
+                read_only_hint=False,
+                destructive_hint=name in _DESTRUCTIVE_TOOLS,
             )
 
 
@@ -811,17 +815,22 @@ if __name__ == "__main__":
         team = os.environ.get("OBSIDIAN_MCP_ACCESS_TEAM_DOMAIN")
         aud = os.environ.get("OBSIDIAN_MCP_ACCESS_AUD")
         access = _AccessVerifier(team, aud) if team and aud else None
+        security = _transport_security()
         if not token and access is None:
             # No auth configured — bare HTTP, fine only for loopback-local testing.
-            mcp.run(transport="streamable-http")
+            mcp.run(
+                transport="streamable-http",
+                host=HTTP_HOST,
+                port=HTTP_PORT,
+                transport_security=security,
+            )
         else:
             import uvicorn
-            app = _AuthASGI(mcp.streamable_http_app(), token=token, access=access)
-            uvicorn.run(
-                app,
-                host=os.environ.get("OBSIDIAN_MCP_HOST", "127.0.0.1"),
-                port=int(os.environ.get("OBSIDIAN_MCP_PORT", "8788")),
-                log_level="warning",
+            app = _AuthASGI(
+                mcp.streamable_http_app(host=HTTP_HOST, transport_security=security),
+                token=token,
+                access=access,
             )
+            uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")
     else:
         mcp.run(transport=transport)

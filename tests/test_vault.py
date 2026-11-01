@@ -11,6 +11,7 @@ os.environ["OBSIDIAN_VAULT"] = "Vault"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import server  # noqa: E402
+from mcp.client import Client  # noqa: E402
 
 VAULT_FREE_TOOLS = {"list_vaults", "version"}
 
@@ -47,9 +48,9 @@ class VaultArgumentTest(unittest.TestCase):
     def test_every_vault_tool_takes_a_vault_argument(self):
         tools = asyncio.run(server.mcp.list_tools())
         for tool in tools:
-            has_vault = "vault" in tool.inputSchema.get("properties", {})
+            has_vault = "vault" in tool.input_schema.get("properties", {})
             self.assertEqual(has_vault, tool.name not in VAULT_FREE_TOOLS, tool.name)
-            self.assertNotIn("vault", tool.inputSchema.get("required", []), tool.name)
+            self.assertNotIn("vault", tool.input_schema.get("required", []), tool.name)
 
     def test_default_vault_when_omitted(self):
         self.call("read_note", path="a.md")
@@ -75,6 +76,22 @@ class VaultArgumentTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "restricted mode"):
             self.call("append_to_note", path="a.md", content="x", vault="Notebooks")
         self.call("append_to_note", path="a.md", content="x")  # default vault still fine
+
+    def test_refusal_text_reaches_the_client(self):
+        # The SDK forwards only ToolError messages; any other exception arrives
+        # as a bare "Error executing tool", and the caller cannot tell a wedged
+        # vault from a typo.
+        self.enabled_plugins["vault=Vault"] = b""
+
+        async def over_the_wire():
+            async with Client(server.mcp) as client:
+                return await client.call_tool(
+                    "append_to_note", {"path": "a.md", "content": "x"}
+                )
+
+        result = asyncio.run(over_the_wire())
+        self.assertTrue(result.is_error)
+        self.assertIn("restricted mode", result.content[0].text)
 
 
 if __name__ == "__main__":
