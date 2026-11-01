@@ -241,13 +241,17 @@ async def _assert_vault_open() -> None:
     _healthy_vaults.add(vault)
 
 
-def _file_args(file: str | None, path: str | None) -> list[str]:
-    """Build file=/path= arguments, raising if neither is given."""
+def _file_args(
+    file: str | None, path: str | None, required: bool = False
+) -> list[str]:
+    """Build file=/path= arguments; with required=True, raise if neither is given."""
     args: list[str] = []
     if file:
         args.append(f"file={file}")
     if path:
         args.append(f"path={path}")
+    if required and not args:
+        raise ToolError("Provide file= or path=")
     return args
 
 
@@ -282,18 +286,14 @@ async def list_vaults() -> str:
 @vault_tool
 async def read_note(file: str | None = None, path: str | None = None) -> str:
     """Read the contents of a note. Specify file (wikilink name) or path (exact)."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     return await _run("read", *fa)
 
 
 @vault_tool
 async def file_info(file: str | None = None, path: str | None = None) -> str:
     """Show metadata for a file (size, dates, links, tags)."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     return await _run("file", *fa)
 
 
@@ -359,9 +359,7 @@ async def append_to_note(
     inline: bool = False,
 ) -> str:
     """Append content to an existing note."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     args = ["append", *fa, f"content={content}"]
     if inline:
         args.append("inline")
@@ -376,9 +374,7 @@ async def prepend_to_note(
     inline: bool = False,
 ) -> str:
     """Prepend content to an existing note."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     args = ["prepend", *fa, f"content={content}"]
     if inline:
         args.append("inline")
@@ -487,9 +483,7 @@ async def move_file(
     path: str | None = None,
 ) -> str:
     """Move or rename a file. 'to' is the destination folder or full path."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     return await _run("move", *fa, f"to={to}")
 
 
@@ -500,9 +494,7 @@ async def rename_file(
     path: str | None = None,
 ) -> str:
     """Rename a file (updates all links)."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     return await _run("rename", *fa, f"name={name}")
 
 
@@ -513,9 +505,7 @@ async def delete_file(
     permanent: bool = False,
 ) -> str:
     """Delete a file (moves to trash by default)."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     args = ["delete", *fa]
     if permanent:
         args.append("permanent")
@@ -548,9 +538,7 @@ async def backlinks(
     path: str | None = None,
 ) -> str:
     """List files that link to a given note."""
-    fa = _file_args(file, path)
-    if not fa:
-        raise ToolError("Provide file= or path=")
+    fa = _file_args(file, path, required=True)
     return await _run("backlinks", *fa, "counts", "format=json")
 
 
